@@ -25,7 +25,7 @@ export const createOrder = async (req, res) => {
       if (product.inventory.stock < item.quantity) {
         return res.status(400).json({
           success: false,
-          message: `Insufficient stock for ${product.name}`
+          message: `Insufficient stock for ${product.name}. Available: ${product.inventory.stock}`
         });
       }
 
@@ -37,9 +37,9 @@ export const createOrder = async (req, res) => {
         quantity: item.quantity,
         price: product.price,
         sustainabilityMetrics: {
-          carbonFootprint: product.sustainabilityMetrics.carbonFootprint * item.quantity,
-          waterSaved: product.sustainabilityMetrics.waterUsage * item.quantity,
-          energySaved: product.sustainabilityMetrics.energyConsumption * item.quantity
+          carbonFootprint: (product.sustainabilityMetrics?.carbonFootprint || 0) * item.quantity,
+          waterSaved: (product.sustainabilityMetrics?.waterUsage || 0) * item.quantity,
+          energySaved: (product.sustainabilityMetrics?.energyConsumption || 0) * item.quantity
         }
       });
 
@@ -59,7 +59,7 @@ export const createOrder = async (req, res) => {
       sustainabilityImpact,
       shippingAddress,
       paymentMethod,
-      notes
+      notes: notes || ''
     });
 
     await order.save();
@@ -72,6 +72,7 @@ export const createOrder = async (req, res) => {
       order
     });
   } catch (error) {
+    console.error('Order creation error:', error);
     res.status(500).json({
       success: false,
       message: 'Error creating order',
@@ -97,7 +98,7 @@ export const getMyOrders = async (req, res) => {
   } catch (error) {
     res.status(500).json({
       success: false,
-      message: 'Error fetching orders',
+      message: 'Error fetching user orders',
       error: error.message
     });
   }
@@ -106,7 +107,7 @@ export const getMyOrders = async (req, res) => {
 // @desc    Get order by ID
 // @route   GET /api/orders/:id
 // @access  Private
-export const getOrder = async (req, res) => {
+export const getOrderById = async (req, res) => {
   try {
     const order = await Order.findById(req.params.id)
       .populate('user', 'name email')
@@ -123,7 +124,7 @@ export const getOrder = async (req, res) => {
     if (order.user._id.toString() !== req.user.id && req.user.role !== 'admin') {
       return res.status(403).json({
         success: false,
-        message: 'Access denied'
+        message: 'Access denied. You can only view your own orders.'
       });
     }
 
@@ -147,11 +148,22 @@ export const updateOrderStatus = async (req, res) => {
   try {
     const { status } = req.body;
 
+    // Validate status
+    const validStatuses = ['pending', 'confirmed', 'processing', 'shipped', 'delivered', 'cancelled'];
+    if (!validStatuses.includes(status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Invalid status. Must be one of: ${validStatuses.join(', ')}`
+      });
+    }
+
     const order = await Order.findByIdAndUpdate(
       req.params.id,
       { status },
       { new: true, runValidators: true }
-    ).populate('user', 'name email').populate('items.product', 'name');
+    )
+    .populate('user', 'name email')
+    .populate('items.product', 'name');
 
     if (!order) {
       return res.status(404).json({
@@ -177,7 +189,7 @@ export const updateOrderStatus = async (req, res) => {
 // @desc    Get all orders (Admin only)
 // @route   GET /api/orders
 // @access  Private/Admin
-export const getOrders = async (req, res) => {
+export const getAllOrders = async (req, res) => {
   try {
     const { page = 1, limit = 10, status } = req.query;
     
@@ -192,7 +204,7 @@ export const getOrders = async (req, res) => {
 
     const orders = await Order.find(filter)
       .populate('user', 'name email')
-      .populate('items.product', 'name')
+      .populate('items.product', 'name images')
       .sort({ createdAt: -1 })
       .limit(limitNum)
       .skip(skip);
@@ -211,6 +223,63 @@ export const getOrders = async (req, res) => {
     res.status(500).json({
       success: false,
       message: 'Error fetching orders',
+      error: error.message
+    });
+  }
+};
+
+// @desc    Cancel order
+// @route   PUT /api/orders/:id/cancel
+// @access  Private
+export const cancelOrder = async (req, res) => {
+  try {
+    const order = await Order.findById(req.params.id);
+
+    if (!order) {
+      return res.status(404).json({
+        success: false,
+        message: 'Order not found'
+      });
+    }
+
+    // Check if user owns the order or is admin
+    if (order.user.toString() !== req.user.id && req.user.role !== 'admin') {
+      return res.status(403).json({
+        success: false,
+        message: 'Access denied'
+      });
+    }
+
+    // Only allow cancellation for pending or confirmed orders
+    if (!['pending', 'confirmed'].includes(order.status)) {
+      return res.status(400).json({
+        success: false,
+        message: `Cannot cancel order with status: ${order.status}`
+      });
+    }
+
+    // Restore product stock
+    for (const item of order.items) {
+      const product = await Product.findById(item.product);
+      if (product) {
+        product.inventory.stock += item.quantity;
+        product.salesCount -= item.quantity;
+        await product.save();
+      }
+    }
+
+    order.status = 'cancelled';
+    await order.save();
+
+    res.json({
+      success: true,
+      message: 'Order cancelled successfully',
+      order
+    });
+  } catch (error) {
+    res.status(500).json({
+      success: false,
+      message: 'Error cancelling order',
       error: error.message
     });
   }
